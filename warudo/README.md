@@ -17,6 +17,7 @@ If you want the `.dll` style mod, you need to setup your building environment an
 This plugin provides a new node.
 You can find and add the `BsEvent` node to your blueprint.
 Connect the output flow pin that you would like to react to your favourite action.
+
 ![overview](docs/overview.jpg)
 
 # Options
