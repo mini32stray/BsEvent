@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' blob: data: ws: wss: http: https:;" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Miss FX</title>
+
+<script src="data.js"></script>
+<script>
+/* ========================== Options ========================== */
+// make sure to comment out if you define it at `data.js` file.
+const AUDIO_URLS        = [ "sounds/miss1.mp3" ];
+
+const WS_URL_DEFAULT    = "ws://127.0.0.1:6557/socket";
+const VISUAL_FX_DEFAULT = true;  // enable visual effect
+const SOUND_FX_DEFAULT  = true;  // enable sound effect
+const DEBUG_DEFAULT     = false; // show status window etc for debug.
+const MASTER_VOLUME     = 0.9;   // master volume
+const MAX_CONCURRENT    = 6;     // max concurrent sound
+const PAN_ABS           = 0.75;  // Pan (left/right) : 0~1, recommended: 0.6~0.85
+const PRELOAD_TIMEOUT   = 10000; // Timeout ms of preloading sound file
+/* ============================================================= */
+</script>
+
+<style>
+  html, body {
+    margin:0;
+    padding:0;
+    width:100%;
+    height:100%;
+    background:transparent;
+    overflow:hidden;
+  }
+  #fx-root {
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    isolation:isolate;
+  }
+
+  .miss-burst {
+    position:absolute; inset:0;
+    opacity:0;
+    animation:fx-pop 650ms cubic-bezier(.2,.6,.2,1) forwards;
+    transform:scale(1.015);
+    will-change:opacity,transform;
+    pointer-events:none;
+  }
+
+  /* frame gradation for left/right. Do we still need it? maybe glowing in `after` is enough for our purpose. */
+  .miss-burst::before {
+    content:"";
+    position:absolute; inset:0;
+    border: 0.1vmin solid transparent;
+    border-radius:2vmin;
+  }
+  .miss-burst.left::before {
+    border-image: linear-gradient(to right, rgba(255,0,0,0.75) 0%, rgba(255,0,0,0.40) 20%, rgba(255,0,0,0.00) 100%) 1;
+  }
+  .miss-burst.right::before {
+    border-image: linear-gradient(to left, rgba(255,0,0,0.75) 0%, rgba(255,0,0,0.40) 20%, rgba(255,0,0,0.00) 100%) 1;
+  }
+
+  /* glow towards inside: this can be masked by left/right classes below */
+  .miss-burst::after {
+    content:"";
+    position:absolute;
+    inset:0;
+    border-radius:0vmin;
+    box-shadow:
+      inset 0 0 0 0.4vmin rgba(255, 40, 40, 0.85),
+      inset 0 0 4vmin 1.2vmin rgba(255, 10, 10, 0.60),
+      inset 0 0 10vmin 2vmin rgba(255, 0, 0, 0.45);
+    filter: saturate(1.12);
+  }
+  .miss-burst.left::after {
+    -webkit-mask-image:
+      linear-gradient(to right, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 25%, rgba(0,0,0,0) 75%);
+    mask-image:
+      linear-gradient(to right, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 25%, rgba(0,0,0,0) 75%);
+  }
+  .miss-burst.right::after {
+    -webkit-mask-image:
+      linear-gradient(to left, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 25%, rgba(0,0,0,0) 75%);
+    mask-image:
+      linear-gradient(to left, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 25%, rgba(0,0,0,0) 75%);
+  }
+  .hidden {
+    display: none;
+  }
+
+  /* animation */
+  @keyframes fx-pop {
+    0%   { opacity:0;   transform:scale(1.045); }
+    12%  { opacity:.95; transform:scale(1.00);  }
+    100% { opacity:0;   transform:scale(1.00);  }
+  }
+
+  #status {
+    position:fixed;
+    top:.6rem;
+    left:.8rem;
+    font:12px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color:rgba(255,255,255,.85);
+    background:rgba(0,0,0,.18);
+    padding:.35rem .5rem;
+    border-radius:.4rem;
+    letter-spacing:.02em;
+    user-select:none;
+  }
+  #status span {
+    opacity:.9
+  }
+</style>
+</head>
+<body>
+  <div id="fx-root" aria-hidden="true"></div>
+  <div id="status">
+    <div>WS: <span id="wsState">init</span></div>
+    <div>Miss: <span id="missCount">0</span> (<span id="lCount">L0</span>/<span id="rCount">R0</span>)</div>
+  </div>
+
+<script>
+const params    = new URLSearchParams(location.search);
+const ws_url    = params.get("ws") || WS_URL_DEFAULT;
+const visualFx  = params.has("novisual") ? false : VISUAL_FX_DEFAULT;
+const soundFx   = params.has("nosound") ? false : SOUND_FX_DEFAULT;
+const isDebug   = params.has("debug") ? false : DEBUG_DEFAULT;
+const fxRoot    = document.getElementById("fx-root");
+const eStatus   = document.getElementById("status");
+const wsStateEl = document.getElementById("wsState");
+const missCountEl = document.getElementById("missCount");
+const lCountEl  = document.getElementById("lCount");
+const rCountEl  = document.getElementById("rCount");
+
+let missCount=0, lCount=0, rCount=0;
+
+/* ---- Audio ---- */
+const Audio = {
+  ctx:null,
+  compressor:null,
+  masterGain:null,
+  buffers:[],
+  activeNodes:[],
+  StereoPanner:null,
+
+  async init(){
+    if (this.ctx) {
+      return;
+    }
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new Ctx({ latencyHint:"interactive" });
+
+    // chain: source -> (panner) -> compressor -> masterGain -> destination
+    this.compressor = this.ctx.createDynamicsCompressor();
+    this.compressor.threshold.value = -24;
+    this.compressor.knee.value = 6;
+    this.compressor.ratio.value = 12;
+    this.compressor.attack.value = 0.003;
+    this.compressor.release.value = 0.25;
+
+    this.masterGain = this.ctx.createGain();
+    this.masterGain.gain.value = MASTER_VOLUME;
+
+    this.compressor.connect(this.masterGain);
+    this.masterGain.connect(this.ctx.destination);
+
+    // StereoPanner availability
+    this.StereoPanner = (typeof this.ctx.createStereoPanner === "function");
+
+    if (AUDIO_URLS.length){
+      await Promise.race([
+        this._loadAll(AUDIO_URLS),
+        new Promise((_,rej) => setTimeout(
+          () => rej(new Error("Audio preload timeout")),
+          PRELOAD_TIMEOUT
+        ))
+      ]).catch(e => console.warn("[MissFx] audio preload:", e.message));
+    }
+  },
+
+  async _loadAll(urls){
+    const decs = urls.map(async (url) => {
+      const res = await fetch(url, { cache:"force-cache" });
+      const arr = await res.arrayBuffer();
+      return await this.ctx.decodeAudioData(arr);
+    });
+    this.buffers =
+      (await Promise.allSettled(decs))
+      .flatMap(r => r.status==="fulfilled" ? [r.value] : []);
+    if (!this.buffers.length){
+      console.warn("[MissFx] No audio buffers loaded.");
+    }
+  },
+
+  async ensureRunning(){
+    if (!this.ctx){
+      return this.init();
+    }
+    if (this.ctx.state !== "running"){
+      try{
+        await this.ctx.resume();
+      }catch{}
+    }
+  },
+
+  playMiss(side){
+    if (!this.buffers.length || !this.ctx){
+      return;
+    }
+    const v_side = side < 0 ? -1 : side > 0 ? + 1 : 0;
+
+    // limit concurrent sound
+    if (this.activeNodes.length >= MAX_CONCURRENT){
+      const node = this.activeNodes.shift();
+      try{
+        node.stop();
+      }catch{}
+    }
+
+    const buf = this.buffers[(Math.random() * this.buffers.length) | 0];
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+
+    // if StereoPanner is not available, use 3D Panner instead.
+    let panner;
+    if (this.StereoPanner){
+      panner = this.ctx.createStereoPanner();
+      panner.pan.value = v_side * PAN_ABS;
+    }else{
+      panner = this.ctx.createPanner();
+      panner.panningModel = "HRTF";
+      // X: left/right, Y:height, Z:distance. move only X.
+      panner.positionX.value = v_side * PAN_ABS;
+      panner.positionY.value = 0;
+      panner.positionZ.value = -0.1;
+    }
+
+    const g = this.ctx.createGain();
+    g.gain.value = 1.0;
+
+    src
+      .connect(g)
+      .connect(panner)
+      .connect(this.compressor);
+
+    src.start();
+    src.addEventListener("ended", () => {
+      const i = this.activeNodes.indexOf(src);
+      if (i >= 0){
+        this.activeNodes.splice(i,1);
+      }
+      try{
+        src.disconnect();
+        g.disconnect();
+        panner.disconnect();
+      }catch{}
+    }, { once:true });
+
+    this.activeNodes.push(src);
+  }
+};
+
+/* add effect class */
+function spawnDamageBurst(side){
+  const wrap = document.createElement("div");
+  wrap.className = "miss-burst" + (side < 0 ? " left" : side > 0 ? " right" : "");
+  wrap.addEventListener(
+    "animationend",
+    () => wrap.remove(),
+    { once:true }
+  );
+  fxRoot.appendChild(wrap);
+}
+
+/* return: left: -1, right: +1, other: 0 */
+function getSideBias(noteCut){
+  const t = noteCut?.noteType;
+  if (typeof t === "string"){
+    switch (t.toLowerCase()){
+      case "notea":
+        return -1;
+      case "noteb":
+        return +1;
+    }
+  }
+  return 0;
+}
+
+function launchFx(side){
+  // visual effect
+  if (visualFx){
+    spawnDamageBurst(side);
+  }
+
+  // status window
+  missCountEl.textContent = (++missCount).toString();
+  if (side<0){
+    lCountEl.textContent = `L${++lCount}`;
+  } else if (side>0){
+    rCountEl.textContent = `R${++rCount}`;
+  }
+
+  // audio
+  if (soundFx){
+    Audio.playMiss(side);
+  }
+}
+
+function processIncomingData(data){
+  const ee = data?.event;
+  if (typeof ee !== "string"){
+    return;
+  }
+  const nc = data.noteCut
+  if (!(["noteMissed", "bombCut"].includes(ee) && nc)){
+    return;
+  }
+  const side = getSideBias(nc);
+  launchFx(side);
+}
+
+/* ---- WebSocket ---- */
+let ws=null;
+let reconnectDelay=1000;
+const RECONNECT_MAX=15000;
+function connectWS(){
+  if (!ws_url){
+    wsStateEl.textContent="no-url";
+    return;
+  }
+  try{
+    ws = new WebSocket(ws_url);
+  }catch(e){
+    console.error("[MissFx] websocket error.")
+    console.error(e);
+    scheduleReconnect();
+    return;
+  }
+
+  wsStateEl.textContent = "connecting";
+  ws.addEventListener("open", ()=>{
+    wsStateEl.textContent="open";
+    reconnectDelay=1000;
+  });
+
+  ws.addEventListener("message", async (ev)=>{
+    Audio.ensureRunning().catch(()=>{});
+    try{
+      const data = JSON.parse(ev.data);
+      processIncomingData(data);
+    }catch{
+      return;
+    }
+  });
+
+  ws.addEventListener("close", ()=>{
+    wsStateEl.textContent="closed";
+    scheduleReconnect();
+  });
+  ws.addEventListener("error", ()=>{
+    wsStateEl.textContent="error";
+  });
+}
+function scheduleReconnect(){
+  if (ws){
+    try{
+      ws.close();
+    }catch{}
+    ws=null;
+  }
+  const d = reconnectDelay;
+  reconnectDelay = Math.min(RECONNECT_MAX, Math.floor(reconnectDelay * 1.8));
+  wsStateEl.textContent = `reconnect in ${d}ms`;
+  setTimeout(connectWS, d);
+}
+
+function prepare_debug(){
+  if (!isDebug){
+    eStatus.classList.add('hidden');
+  }
+}
+
+(async function main(){
+  prepare_debug();
+
+  try{
+    await Audio.init();
+  }catch(e){
+    console.warn("[MissFx] audio init:", e);
+  }
+  connectWS();
+
+  // manual test: press keyboard L: left, R: right, M: other
+  window.addEventListener("keydown",(e)=>{
+    const k=e.key.toLowerCase();
+    if (k==="m"){
+      launchFx(0);
+    }
+    if (k==="l"){
+      launchFx(-1);
+    }
+    if (k==="r"){
+      launchFx(1);
+    }
+  });
+})();
+</script>
+</body>
+</html>
