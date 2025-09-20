@@ -18,15 +18,15 @@ public class BsEventBroker : IDisposable
 {
     public class BsEventMessage
     {
-        public BsEventMessage(string _event, long time, JObject? status)
+        public BsEventMessage(string _event, long time, JObject? obj)
         {
             Event = _event;
             Time = time;
-            Status = status;
+            Obj = obj;
         }
         public string Event{ get; }
         public long Time { get; }
-        public JObject? Status { get; }
+        public JObject? Obj { get; }
     }
 
     public ConcurrentQueue<BsEventMessage> MsgQueue { get; private set; }
@@ -169,8 +169,35 @@ public class BsEventBroker : IDisposable
             Debug.LogError($"error while parsing received json: {text}");
             return;
         }
+        if (e == "noteMissed" || e == "bombCut")
+        {
+            var nc = j["noteCut"];
+            if (nc == null)
+            {
+                return;
+            }
+        }
         var msg = new BsEventMessage(e, t, null);
         MsgQueue.Enqueue(msg);
+
+        if (e == "noteCut")
+        {
+            var nc = j["noteCut"] as JObject;
+            if (nc == null)
+            {
+                return;
+            }
+            var ok =
+                nc.Value<bool>("speedOK") &&
+                nc.Value<bool>("directionOK") &&
+                nc.Value<bool>("saberTypeOK") &&
+                (!nc.Value<bool>("wasCutTooSoon"));
+            var _exMsg = new BsEventMessage(
+                ok ? "_goodCut" : "_badCut",
+                t,
+                null);
+            MsgQueue.Enqueue(_exMsg);
+        }
     }
 
     public void Dispose()
@@ -243,21 +270,15 @@ public class BsEventNode : Node
     [FlowOutput]
     public Continuation? SoftFailed = null;
     [FlowOutput]
-    public Continuation? ScoreChanged = null;
-    [FlowOutput]
-    public Continuation? EnergyChanged = null;
-    [FlowOutput]
-    public Continuation? NoteSpawned = null;
-    [FlowOutput]
-    public Continuation? Other = null;
-    [FlowOutput]
-    public Continuation? BeatmapEvent = null;
-    [FlowOutput]
     public Continuation? Pause = null;
     [FlowOutput]
     public Continuation? Resume = null;
     [FlowOutput]
     public Continuation? Menu = null;
+    [FlowOutput]
+    public Continuation? _GoodCut = null;
+    [FlowOutput]
+    public Continuation? _BadCut = null;
 
     [DataInput]
     public bool autoStart = false;
@@ -310,14 +331,11 @@ public class BsEventNode : Node
             { "finished", nameof(Finished) },
             { "failed", nameof(Failed) },
             { "softFailed", nameof(SoftFailed) },
-            { "scoreChanged", nameof(ScoreChanged) },
-            { "energyChanged", nameof(EnergyChanged) },
-            { "noteSpawned", nameof(NoteSpawned) },
-            { "other", nameof(Other) },
-            { "beatmapEvent", nameof(BeatmapEvent) },
             { "pause", nameof(Pause) },
             { "resume", nameof(Resume) },
             { "menu", nameof(Menu) },
+            { "_goodCut", nameof(_GoodCut) },
+            { "_badCut", nameof(_BadCut) },
         };
         autoStarter = new(DateTime.Now);
     }
